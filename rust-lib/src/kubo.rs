@@ -44,6 +44,28 @@ fn spawn_on_supervisor(mut cmd: Command) -> std::io::Result<Child> {
     rrx.recv().map_err(|e| std::io::Error::other(e.to_string()))?
 }
 
+/// Kubo's `lowpower` profile, plus announcing only pinned content (what this device
+/// chose to keep or publish) instead of every block it ever fetched.
+pub const DESKTOP_CONFIG: &[(&str, &str)] = &[
+    ("Routing.Type", "\"autoclient\""),
+    ("Swarm.ConnMgr", r#"{"Type":"basic","LowWater":10,"HighWater":20,"GracePeriod":"20s"}"#),
+    ("Swarm.RelayService", r#"{"Enabled":false}"#),
+    ("AutoNAT", r#"{"ServiceMode":"disabled"}"#),
+    // UDP transports (QUIC, WebTransport, WebRTC) were what flooded a NAT-ed link in
+    // testing: with them every request on the machine timed out at 20 s, TCP-only kept
+    // ~200 ms with 130+ peers and still fetched in a few seconds.
+    ("Swarm.Transports.Network", r#"{"QUIC":false,"WebTransport":false,"WebRTCDirect":false,"Websocket":false}"#),
+];
+
+/// The announce strategy moved from `Reprovider.Strategy` to `Provide.Strategy` in
+/// Kubo 0.38 (and older keys then stop the daemon), so pick by version.
+fn provide_strategy_key(bin: &Path, repo: &Path) -> &'static str {
+    let v = run(bin, repo, &["version", "--number"]).unwrap_or_default();
+    let mut it = v.trim().split('.').map(|p| p.parse::<u32>().unwrap_or(0));
+    let (major, minor) = (it.next().unwrap_or(0), it.next().unwrap_or(0));
+    if major > 0 || minor >= 38 { "Provide.Strategy" } else { "Reprovider.Strategy" }
+}
+
 pub struct Kubo {
     pub bin: PathBuf,
     pub repo: PathBuf,
@@ -119,6 +141,19 @@ impl Kubo {
         let (api, gw) = (free_port()?, free_port()?);
         run(&self.bin, &self.repo, &["config", "Addresses.API", &format!("/ip4/127.0.0.1/tcp/{api}")])?;
         run(&self.bin, &self.repo, &["config", "Addresses.Gateway", &format!("/ip4/127.0.0.1/tcp/{gw}")])?;
+        // A desktop citizen, applied on every start so older repos get it too. Kubo's
+        // defaults (DHT server, hundreds of connections) saturated a home connection in
+        // testing: every other request on the machine timed out until the node stopped.
+        for (k, v) in DESKTOP_CONFIG {
+            run(&self.bin, &self.repo, &["config", "--json", k, v])?;
+        }
+        run(&self.bin, &self.repo, &["config", provide_strategy_key(&self.bin, &self.repo), "pinned"])?;
+        // listen on TCP only (keep the random port init chose)
+        let swarm: Vec<String> = serde_json::from_str(&run(&self.bin, &self.repo, &["config", "Addresses.Swarm"])?).unwrap_or_default();
+        let tcp: Vec<String> = swarm.into_iter().filter(|a| a.contains("/tcp/") && !a.contains("/ws")).collect();
+        if !tcp.is_empty() {
+            run(&self.bin, &self.repo, &["config", "--json", "Addresses.Swarm", &serde_json::to_string(&tcp).unwrap()])?;
+        }
         Ok((api, gw))
     }
 
@@ -253,6 +288,10 @@ mod tests {
         let mut k = k2;
         std::thread::sleep(Duration::from_secs(2));
         assert!(k.running(), "daemon died with its spawning thread");
+        let cfg: Value = serde_json::from_str(&std::fs::read_to_string(dir.join("repo/config")).unwrap()).unwrap();
+        assert_eq!(cfg["Swarm"]["Transports"]["Network"]["QUIC"], false);
+        assert_eq!(cfg["Routing"]["Type"], "autoclient");
+        assert!(cfg["Addresses"]["Swarm"].as_array().unwrap().iter().all(|a| a.as_str().unwrap().contains("/tcp/")));
         assert_eq!(s["running"], true);
         assert!(s["peerId"].as_str().unwrap().starts_with("12D3"));
         // a block round trip through the RPC API and the gateway
