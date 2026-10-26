@@ -45,7 +45,10 @@ let raw = ipfs_module::IpfsModuleClient::new().endpoints_with_timeout(Duration::
   stopped); the UDP transports were the cause. So the node runs:
   - Kubo's `lowpower` profile: DHT client only, no relay service, no AutoNAT service;
   - **TCP only** (QUIC, WebTransport, WebRTC and WebSocket off);
-  - 10-20 connections;
+  - 10-20 connections kept, and a **hard cap of 64** through libp2p's resource manager
+    (`libp2p-resource-limit-overrides.json`). The connection manager alone only trims after a
+    grace period, so a starting node still burst to 318 peers and Gnosis RPC calls from the
+    same machine timed out; with the cap it peaked at 44 and calls stayed around 60-150 ms;
   - announcing **pinned content only**, not every block it ever fetched.
 - Linux: `pkgsStatic.kubo` (one static binary, no system libraries). macOS: nixpkgs `kubo`.
 

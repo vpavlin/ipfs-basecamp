@@ -1,7 +1,7 @@
 {
   "name": "ipfs_module",
   "display_name": "IPFS Node",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "An IPFS node for every Logos app on this device: runs a bundled Kubo on loopback ports and exposes its RPC API and gateway. Apps pin, fetch and provide content-addressed data without a third-party gateway.",
   "author": "vpavlin",
   "type": "core",

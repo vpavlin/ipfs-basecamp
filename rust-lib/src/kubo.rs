@@ -57,6 +57,10 @@ pub const DESKTOP_CONFIG: &[(&str, &str)] = &[
     ("Swarm.Transports.Network", r#"{"QUIC":false,"WebTransport":false,"WebRTCDirect":false,"Websocket":false}"#),
 ];
 
+/// Hard connection caps for libp2p's resource manager (a partial limit config: what
+/// is not set keeps Kubo's defaults).
+pub const RESOURCE_LIMITS: &str = r#"{"System":{"Conns":64,"ConnsInbound":24,"ConnsOutbound":48},"Transient":{"Conns":24,"ConnsInbound":12,"ConnsOutbound":24}}"#;
+
 /// The announce strategy moved from `Reprovider.Strategy` to `Provide.Strategy` in
 /// Kubo 0.38 (and older keys then stop the daemon), so pick by version.
 fn provide_strategy_key(bin: &Path, repo: &Path) -> &'static str {
@@ -148,6 +152,10 @@ impl Kubo {
             run(&self.bin, &self.repo, &["config", "--json", k, v])?;
         }
         run(&self.bin, &self.repo, &["config", provide_strategy_key(&self.bin, &self.repo), "pinned"])?;
+        // ConnMgr only trims after its grace period, so a starting node still bursts to
+        // hundreds of connections (318 seen) and starves the machine's other requests.
+        // The resource manager's limits are hard: refuse connections past them.
+        std::fs::write(self.repo.join("libp2p-resource-limit-overrides.json"), RESOURCE_LIMITS).map_err(|e| e.to_string())?;
         // listen on TCP only (keep the random port init chose)
         let swarm: Vec<String> = serde_json::from_str(&run(&self.bin, &self.repo, &["config", "Addresses.Swarm"])?).unwrap_or_default();
         let tcp: Vec<String> = swarm.into_iter().filter(|a| a.contains("/tcp/") && !a.contains("/ws")).collect();
@@ -317,5 +325,44 @@ mod tests {
         assert_eq!(s["peerId"], peer.as_str());
         k.stop();
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Online: the hard limits hold the connection count down while the node joins
+    /// the network, and other requests from this machine stay fast meanwhile.
+    /// FV_KUBO_BIN=/path/to/ipfs cargo test --no-default-features -- --ignored --nocapture online
+    #[test]
+    #[ignore]
+    fn online_connection_count_stays_bounded() {
+        let bin = PathBuf::from(std::env::var("FV_KUBO_BIN").expect("FV_KUBO_BIN"));
+        let dir = std::env::temp_dir().join(format!("ipfs-module-online-{}", std::process::id()));
+        let mut k = Kubo::new(bin, dir.join("repo"));
+        k.start(Duration::from_secs(60)).unwrap();
+        assert!(dir.join("repo/libp2p-resource-limit-overrides.json").exists());
+        let c = reqwest::blocking::Client::builder().timeout(Duration::from_secs(20)).build().unwrap();
+        let mut worst_peers = 0;
+        let mut worst_rpc = Duration::ZERO;
+        for i in 0..24 {
+            std::thread::sleep(Duration::from_secs(5));
+            let peers = c
+                .post(format!("{}/api/v0/swarm/peers", k.api))
+                .send()
+                .and_then(|r| r.json::<Value>())
+                .map(|v| v["Peers"].as_array().map(|a| a.len()).unwrap_or(0))
+                .unwrap_or(0);
+            let t = std::time::Instant::now();
+            let ok = c
+                .post("https://gnosis.drpc.org")
+                .json(&serde_json::json!({"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}))
+                .send()
+                .is_ok();
+            let dt = t.elapsed();
+            eprintln!("t={:>3}s peers={peers:>4} rpc={:>5}ms ok={ok}", (i + 1) * 5, dt.as_millis());
+            worst_peers = worst_peers.max(peers);
+            worst_rpc = worst_rpc.max(dt);
+        }
+        k.stop();
+        let _ = std::fs::remove_dir_all(dir);
+        eprintln!("worst: {worst_peers} peers, {} ms", worst_rpc.as_millis());
+        assert!(worst_peers <= 64, "{worst_peers} peers");
     }
 }
